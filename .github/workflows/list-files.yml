@@ -1,1 +1,39 @@
+name: List repo files
 
+on:
+  workflow_dispatch:
+
+jobs:
+  list-files:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build file list
+        run: |
+          pwd
+          find . -type f | sort > file-list.txt
+          echo "Generated $(wc -l < file-list.txt) files"
+
+      - name: Show first lines in logs
+        run: |
+          echo "=== First 200 lines of file-list.txt ==="
+          sed -n '1,200p' file-list.txt
+
+      - name: Add summary to run page
+        run: |
+          echo "## Repository file list" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Total files: $(wc -l < file-list.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,200p' file-list.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-file-list
+          path: file-list.txt
