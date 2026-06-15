@@ -1,0 +1,382 @@
+name: OpenCode Events Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Task for OpenCode"
+        required: false
+        default: |
+          Use your available tools.
+
+          Task:
+          1. Inspect the current working directory.
+          2. Create a file opencode-result.txt with exactly this content:
+          OPENCODE_GITHUB_RUNNER_OK
+          3. Read opencode-result.txt back.
+          4. Reply with a short summary.
+
+          Important:
+          Actually use tools. Do not answer from memory.
+        type: string
+
+jobs:
+  opencode-events:
+    runs-on: ubuntu-latest
+
+    env:
+      OPENCODE_PORT: "4096"
+      MOCK_BACKEND_PORT: "8787"
+      SESSION_UUID: "github-opencode-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+      OPENCODE_MODEL_PROVIDER: "mistral"
+      OPENCODE_MODEL_ID: "mistral-large-latest"
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenCode
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install opencode-ai
+        run: |
+          npm i -g opencode-ai
+          opencode --version
+
+      - name: Prepare files
+        run: |
+          mkdir -p .ai-opencode
+          echo "OPENCODE_INPUT_FILE_OK" > tool-test.txt
+
+          # OpenCode docs say it can load provider keys from env or .env.
+          # Do not print the secret.
+          {
+            echo "MISTRAL_API_KEY=${MISTRAL_API_KEY}"
+          } > .env
+
+      - name: Write mock backend and collector
+        run: |
+          cat > .ai-opencode/mock_backend.py <<'PY'
+          import http.server
+          import json
+          import os
+          import time
+
+          OUT = os.environ.get("MOCK_BACKEND_OUT", ".ai-opencode/gitverse-ingest.jsonl")
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get("content-length", "0"))
+                  body = self.rfile.read(length)
+
+                  os.makedirs(os.path.dirname(OUT), exist_ok=True)
+                  with open(OUT, "ab") as f:
+                      f.write(body)
+                      f.write(b"\n")
+
+                  try:
+                      data = json.loads(body.decode("utf-8"))
+                      event_type = data.get("source_event_type")
+                      event_id = data.get("source_event_id")
+                      session = data.get("source_session_id")
+                      print(f"[mock-ingest] {event_type} {event_id} session={session}", flush=True)
+                  except Exception as e:
+                      print(f"[mock-ingest] bad json: {e}", flush=True)
+
+                  self.send_response(201)
+                  self.send_header("content-type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(b'{"status":"ok"}')
+
+              def log_message(self, fmt, *args):
+                  return
+
+          port = int(os.environ.get("MOCK_BACKEND_PORT", "8787"))
+          server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+          print(f"[mock-ingest] listening on 127.0.0.1:{port}", flush=True)
+          server.serve_forever()
+          PY
+
+          cat > .ai-opencode/collector.py <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+
+          OPENCODE_EVENT_URL = os.environ.get("OPENCODE_EVENT_URL", "http://127.0.0.1:4096/event")
+          INGEST_URL = os.environ.get("GITVERSE_INGEST_URL", "http://127.0.0.1:8787/sc/sbt/api/v1/ai/task-sessions/local/events")
+          SESSION_UUID = os.environ.get("SESSION_UUID", "local-session")
+          RAW_OUT = os.environ.get("RAW_OUT", ".ai-opencode/opencode-events.raw.jsonl")
+          MAX_SECONDS = int(os.environ.get("COLLECTOR_TIMEOUT_SECONDS", "180"))
+
+          os.makedirs(os.path.dirname(RAW_OUT), exist_ok=True)
+
+          def post_json(url, payload):
+              body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method="POST",
+                  headers={
+                      "content-type": "application/json",
+                      "authorization": "Bearer fake-internal-token",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  resp.read()
+
+          def source_session_id(event):
+              props = event.get("properties") or {}
+              return props.get("sessionID", "")
+
+          def to_ingest_payload(event):
+              return {
+                  "session_uuid": SESSION_UUID,
+                  "source": "opencode",
+                  "source_session_id": source_session_id(event),
+                  "source_event_id": event.get("id", ""),
+                  "source_event_type": event.get("type", ""),
+                  "payload": event,
+              }
+
+          def is_done(event):
+              typ = event.get("type")
+              props = event.get("properties") or {}
+
+              if typ == "session.idle":
+                  return True
+
+              if typ == "session.status":
+                  status = props.get("status") or {}
+                  return status.get("type") == "idle"
+
+              return False
+
+          deadline = time.time() + MAX_SECONDS
+          print(f"[collector] connect {OPENCODE_EVENT_URL}", flush=True)
+
+          req = urllib.request.Request(OPENCODE_EVENT_URL, method="GET")
+
+          with urllib.request.urlopen(req, timeout=MAX_SECONDS + 30) as resp:
+              for raw_line in resp:
+                  if time.time() > deadline:
+                      print("[collector] timeout", flush=True)
+                      sys.exit(2)
+
+                  line = raw_line.decode("utf-8", errors="replace").strip()
+                  if not line:
+                      continue
+
+                  # Robust for lines like "0 data: {...}" from noisy terminals.
+                  idx = line.find("data:")
+                  if idx < 0:
+                      continue
+
+                  data = line[idx + len("data:"):].strip()
+                  if not data.startswith("{"):
+                      continue
+
+                  try:
+                      event = json.loads(data)
+                  except json.JSONDecodeError as e:
+                      print(f"[collector] bad json: {e}: {data[:200]}", flush=True)
+                      continue
+
+                  with open(RAW_OUT, "a", encoding="utf-8") as f:
+                      f.write(json.dumps(event, ensure_ascii=False))
+                      f.write("\n")
+
+                  print(f"[collector] {event.get('type')} {event.get('id')}", flush=True)
+
+                  try:
+                      post_json(INGEST_URL, to_ingest_payload(event))
+                  except Exception as e:
+                      print(f"[collector] ingest failed: {e}", flush=True)
+
+                  if is_done(event):
+                      print("[collector] done", flush=True)
+                      sys.exit(0)
+
+          print("[collector] stream ended", flush=True)
+          PY
+
+      - name: Start fake GitVerse backend ingest
+        run: |
+          python3 .ai-opencode/mock_backend.py > .ai-opencode/mock-backend.log 2>&1 &
+          echo $! > .ai-opencode/mock-backend.pid
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 "$MOCK_BACKEND_PORT"; then
+              echo "mock backend is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "mock backend failed to start"
+          cat .ai-opencode/mock-backend.log || true
+          exit 1
+
+      - name: Start OpenCode serve
+        run: |
+          opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT" > .ai-opencode/opencode-server.log 2>&1 &
+          echo $! > .ai-opencode/opencode-server.pid
+
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
+              echo "opencode server is ready via /global/health"
+              exit 0
+            fi
+
+            if curl -fsS "http://127.0.0.1:${OPENCODE_PORT}/doc" >/dev/null 2>&1; then
+              echo "opencode server is ready via /doc"
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          echo "opencode failed to start"
+          cat .ai-opencode/opencode-server.log || true
+          exit 1
+
+      - name: Start collector
+        run: |
+          export OPENCODE_EVENT_URL="http://127.0.0.1:${OPENCODE_PORT}/event"
+          export GITVERSE_INGEST_URL="http://127.0.0.1:${MOCK_BACKEND_PORT}/sc/sbt/api/v1/ai/task-sessions/${SESSION_UUID}/events"
+          export RAW_OUT=".ai-opencode/opencode-events.raw.jsonl"
+          export MOCK_BACKEND_OUT=".ai-opencode/gitverse-ingest.jsonl"
+
+          python3 .ai-opencode/collector.py > .ai-opencode/collector.log 2>&1 &
+          echo $! > .ai-opencode/collector.pid
+
+          sleep 2
+          echo "collector started"
+
+      - name: Create OpenCode session and send prompt
+        run: |
+          cat > .ai-opencode/prompt.txt <<'PROMPT'
+          ${{ inputs.prompt }}
+          PROMPT
+
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          base = f"http://127.0.0.1:{os.environ['OPENCODE_PORT']}"
+          provider = os.environ["OPENCODE_MODEL_PROVIDER"]
+          model = os.environ["OPENCODE_MODEL_ID"]
+
+          def request_json(method, url, payload):
+              body = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method=method,
+                  headers={"content-type": "application/json"},
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  raw = resp.read()
+                  return json.loads(raw.decode("utf-8")) if raw else None
+
+          with open(".ai-opencode/prompt.txt", "r", encoding="utf-8") as f:
+              prompt = f.read()
+
+          session = request_json("POST", f"{base}/session", {
+              "title": "github-opencode-events-smoke"
+          })
+
+          print("[client] session:", json.dumps(session, ensure_ascii=False))
+
+          session_id = session["id"]
+
+          body = {
+              "model": {
+                  "providerID": provider,
+                  "modelID": model,
+              },
+              "parts": [
+                  {
+                      "type": "text",
+                      "text": prompt,
+                  }
+              ],
+          }
+
+          result = request_json("POST", f"{base}/session/{session_id}/prompt_async", body)
+          print("[client] prompt_async:", json.dumps(result, ensure_ascii=False))
+          PY
+
+      - name: Wait collector done
+        run: |
+          COLLECTOR_PID="$(cat .ai-opencode/collector.pid)"
+
+          for i in {1..180}; do
+            if ! kill -0 "$COLLECTOR_PID" >/dev/null 2>&1; then
+              echo "collector exited"
+              cat .ai-opencode/collector.log || true
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "collector did not finish in time"
+          cat .ai-opencode/collector.log || true
+          exit 1
+
+      - name: Show collected events summary
+        if: always()
+        run: |
+          echo "=== raw OpenCode events count ==="
+          test -f .ai-opencode/opencode-events.raw.jsonl && wc -l .ai-opencode/opencode-events.raw.jsonl || true
+
+          echo "=== fake GitVerse ingest events count ==="
+          test -f .ai-opencode/gitverse-ingest.jsonl && wc -l .ai-opencode/gitverse-ingest.jsonl || true
+
+          echo "=== event types ==="
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          path = ".ai-opencode/opencode-events.raw.jsonl"
+          c = Counter()
+          try:
+              with open(path, "r", encoding="utf-8") as f:
+                  for line in f:
+                      if line.strip():
+                          c[json.loads(line).get("type")] += 1
+          except FileNotFoundError:
+              pass
+          for k, v in c.most_common():
+              print(f"{k}: {v}")
+          PY
+
+          echo "=== files ==="
+          ls -la
+          test -f opencode-result.txt && cat opencode-result.txt || true
+
+      - name: Stop background processes
+        if: always()
+        run: |
+          for f in .ai-opencode/collector.pid .ai-opencode/opencode-server.pid .ai-opencode/mock-backend.pid; do
+            if [ -f "$f" ]; then
+              kill "$(cat "$f")" >/dev/null 2>&1 || true
+            fi
+          done
+
+      - name: Upload OpenCode smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-events-smoke
+          path: |
+            .ai-opencode/*.log
+            .ai-opencode/*.jsonl
+            .ai-opencode/prompt.txt
+            opencode-result.txt
+          if-no-files-found: ignore
