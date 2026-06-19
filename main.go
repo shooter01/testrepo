@@ -79,7 +79,7 @@ func NewApp(cfg Config, logger *log.Logger) *App {
 }
 
 func (a *App) Run() error {
-	a.logger.Printf("starting! %s in %s on %s", a.cfg.AppName, a.cfg.Env, a.server.Addr)
+	a.logger.Printf("starting %s in %s on %s", a.cfg.AppName, a.cfg.Env, a.server.Addr)
 
 	errCh := make(chan error, 1)
 	go func() {
